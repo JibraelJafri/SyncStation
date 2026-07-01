@@ -1,0 +1,50 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local SQLite databases & cache
+*.db
+*.db-shm
+*.db-wal
+.cache/
+sync_cache.json
+
+# User settings, session headers & secrets
+.settings.json
+settings.ini
+headers_auth.json
+oauth.json
+browser.json
+*.ini
+.env
+.env.*
+
+# Personal user exports & music dumps
+*.json
+*.csv
+*.tsv
+*.zip
+exports/
+data/
+
+# Application logs
+logs/
+*.log
+
+# OS & Editor generated files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
