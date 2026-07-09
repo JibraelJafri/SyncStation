@@ -63,6 +63,19 @@ class SyncPlanner:
                 if m.yt_video_id:
                     manifest_by_vid[m.yt_video_id] = m
 
+        dest_display = "Deezer" if (mirror and mirror.destination == "deezer") else "YouTube Music"
+
+        # Identify duplicates on destination playlist
+        seen_dest_track_ids: Set[str] = set()
+        duplicate_dest_tracks: List[Track] = []
+        for t in dest_tracks:
+            if not t.id:
+                continue
+            if t.id in seen_dest_track_ids:
+                duplicate_dest_tracks.append(t)
+            else:
+                seen_dest_track_ids.add(t.id)
+
         # 1. Process Source Tracks (Additions vs Already Present vs Restorations)
         source_uris_in_plan: Set[str] = set()
         matched_dest_vids: Set[str] = set()
@@ -84,7 +97,7 @@ class SyncPlanner:
             elif t_clean in dest_queries:
                 matched_vid = dest_queries[t_clean]
             elif dest_tracks:
-                # Fuzzy token match for slight naming variances on YouTube Music
+                # Fuzzy token match for slight naming variances on destination
                 comb_sp = f"{track.artist} {track.name}".lower()
                 for dt in dest_tracks:
                     if not dt.name or dt.id in matched_dest_vids:
@@ -102,18 +115,18 @@ class SyncPlanner:
                     destination_video_id=matched_vid,
                     confidence_tier=ConfidenceTier.EXACT,
                     confidence_score=1.0,
-                    rationale="Already present on YouTube Music (in sync)",
+                    rationale=f"Already present on {dest_display} (in sync)",
                     is_accepted=True
                 ))
             elif manifest_entry and dest_vids and manifest_entry.yt_video_id not in dest_vids:
-                # Track was previously synced, but is missing on YouTube Music (accidentally deleted on YT)
+                dest_short = "Deezer" if (mirror and mirror.destination == "deezer") else "YT"
                 plan_items.append(SyncPlanItem(
                     action=PlanAction.ADD_TRACK,
                     source_track=track,
                     destination_video_id=manifest_entry.yt_video_id,
                     confidence_tier=ConfidenceTier.EXACT,
                     confidence_score=1.0,
-                    rationale=f"Missing on YouTube Music (deleted on YT — will restore: '{track.artist} - {track.name}')",
+                    rationale=f"Missing on {dest_display} (deleted on {dest_short} — will restore: '{track.artist} - {track.name}')",
                     requires_user_review=False,
                     is_accepted=True
                 ))
@@ -133,6 +146,8 @@ class SyncPlanner:
         if manifest_tracks:
             for m in manifest_tracks:
                 if m.spotify_uri not in source_uris_in_plan:
+                    if dest_vids and m.yt_video_id not in dest_vids:
+                        continue
                     if active_policy.removals == RemovalPolicy.NEVER_REMOVE:
                         plan_items.append(SyncPlanItem(
                             action=PlanAction.SKIP_TRACK,
@@ -146,7 +161,7 @@ class SyncPlanner:
                             destination_video_id=m.yt_video_id,
                             rationale=f"Removed from Spotify: '{m.spotify_artist} - {m.spotify_name}'",
                             requires_user_review=True,
-                            is_accepted=False # Requires user explicit opt-in
+                            is_accepted=False # Requires user review / opt-in
                         ))
                     elif active_policy.removals == RemovalPolicy.MIRROR_REMOVALS:
                         plan_items.append(SyncPlanItem(
@@ -157,23 +172,55 @@ class SyncPlanner:
                             is_accepted=True
                         ))
 
-        # 3. Process Extra YouTube-only Tracks (Tracks added directly on YouTube Music)
+        # 3. Process Duplicate Tracks on Destination
+        for dt in duplicate_dest_tracks:
+            plan_items.append(SyncPlanItem(
+                action=PlanAction.REMOVE_TRACK,
+                destination_video_id=dt.id,
+                source_track=dt,
+                confidence_tier=ConfidenceTier.EXACT,
+                confidence_score=1.0,
+                rationale=f"Duplicate on {dest_display}: '{dt.artist} - {dt.name}'",
+                requires_user_review=(active_policy.removals == RemovalPolicy.ASK_BEFORE_REMOVE),
+                is_accepted=(active_policy.removals == RemovalPolicy.MIRROR_REMOVALS)
+            ))
+
+        # 4. Process Extra Destination-only Tracks (Tracks added directly on destination)
         if dest_tracks:
             for t in dest_tracks:
-                if t.id and t.id not in matched_dest_vids and t.id not in manifest_by_vid:
-                    plan_items.append(SyncPlanItem(
-                        action=PlanAction.SKIP_TRACK,
-                        destination_video_id=t.id,
-                        source_track=t,
-                        rationale=f"YouTube Music-only track: '{t.artist} - {t.name}' (kept intact)",
-                        requires_user_review=False,
-                        is_accepted=False
-                    ))
+                if t.id and t.id not in matched_dest_vids and t.id not in manifest_by_vid and t not in duplicate_dest_tracks:
+                    if active_policy.removals == RemovalPolicy.NEVER_REMOVE:
+                        plan_items.append(SyncPlanItem(
+                            action=PlanAction.SKIP_TRACK,
+                            destination_video_id=t.id,
+                            source_track=t,
+                            rationale=f"{dest_display}-only track: '{t.artist} - {t.name}' (kept per 'Never Remove' policy)",
+                            requires_user_review=False,
+                            is_accepted=False
+                        ))
+                    elif active_policy.removals == RemovalPolicy.ASK_BEFORE_REMOVE:
+                        plan_items.append(SyncPlanItem(
+                            action=PlanAction.REMOVE_TRACK,
+                            destination_video_id=t.id,
+                            source_track=t,
+                            rationale=f"{dest_display}-only track (not in Spotify): '{t.artist} - {t.name}'",
+                            requires_user_review=True,
+                            is_accepted=False
+                        ))
+                    elif active_policy.removals == RemovalPolicy.MIRROR_REMOVALS:
+                        plan_items.append(SyncPlanItem(
+                            action=PlanAction.REMOVE_TRACK,
+                            destination_video_id=t.id,
+                            source_track=t,
+                            rationale=f"Mirroring Spotify removal ({dest_display}-only): '{t.artist} - {t.name}'",
+                            requires_user_review=False,
+                            is_accepted=True
+                        ))
 
         # Calculate summary statistics
         additions_count = sum(1 for item in plan_items if item.action == PlanAction.ADD_TRACK and not item.destination_video_id)
         restorations_count = sum(1 for item in plan_items if item.action == PlanAction.ADD_TRACK and item.destination_video_id)
-        extra_dest_count = sum(1 for item in plan_items if item.action == PlanAction.SKIP_TRACK and "YouTube Music-only" in item.rationale)
+        extra_dest_count = sum(1 for item in plan_items if item.action == PlanAction.SKIP_TRACK and "-only track" in item.rationale)
         removals_count = sum(1 for item in plan_items if item.action == PlanAction.REMOVE_TRACK)
         unchanged_count = sum(1 for item in plan_items if item.action == PlanAction.NO_OP)
 
