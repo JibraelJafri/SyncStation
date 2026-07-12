@@ -43,3 +43,7 @@ class MusicDestination(ABC):
     def rate_track(self, video_id: str, rating: str = "LIKE") -> bool:
         """Rate/like a track on destination."""
         pass
+
+    def remove_tracks_from_playlist(self, playlist_id: str, video_ids: Any) -> int:
+        """Remove tracks from playlist on destination."""
+        return 0
