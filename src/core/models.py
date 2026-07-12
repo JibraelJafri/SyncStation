@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime, timezone
 
 def utc_now():
@@ -102,6 +102,11 @@ class CandidateTrack(BaseModel):
     thumbnail_url: Optional[str] = None
     views: Optional[str] = None
     is_explicit: bool = False
+    isrc: Optional[str] = None
+
+    @property
+    def destination_id(self) -> str:
+        return self.video_id
 
 class MatchResult(BaseModel):
     source_track: Track
@@ -121,10 +126,12 @@ class MirrorStatus(str, Enum):
     ATTENTION_NEEDED = "ATTENTION_NEEDED"
     NEVER_SYNCED = "NEVER_SYNCED"
     ERROR = "ERROR"
+    UNREACHABLE = "UNREACHABLE"
 
 class MirroredPlaylist(BaseModel):
     id: str
     name: str
+    destination: str = "youtube"  # "youtube" or "deezer"
     spotify_id: str = ""
     spotify_uri: str = ""
     spotify_url: Optional[str] = None
@@ -144,6 +151,10 @@ class MirroredPlaylist(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
+    @property
+    def destination_playlist_id(self) -> str:
+        return self.yt_playlist_id
+
 class MirrorTrackManifest(BaseModel):
     id: Optional[int] = None
     mirror_id: str
@@ -157,6 +168,10 @@ class MirrorTrackManifest(BaseModel):
     yt_artist: str
     position: int = 0
     synced_at: datetime = Field(default_factory=utc_now)
+
+    @property
+    def destination_id(self) -> str:
+        return self.yt_video_id
 
 class SyncPlanItem(BaseModel):
     action: PlanAction
@@ -214,6 +229,7 @@ class SpotifySnapshotMetadata(BaseModel):
 
 class SyncJob(BaseModel):
     id: str
+    destination: str = "youtube"  # "youtube" or "deezer"
     mirror_id: Optional[str] = None
     playlist_name: str
     spotify_url_or_id: str
@@ -234,12 +250,69 @@ class SyncJob(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
+class TransferOutcome(str, Enum):
+    COMPLETE_SUCCESS = "COMPLETE_SUCCESS"
+    PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
+    IN_SYNC = "IN_SYNC"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+class TrackDiscrepancy(BaseModel):
+    item_id: Optional[int] = None
+    track_index: int = 0
+    source_name: str = ""
+    source_artist: str = ""
+    source_album: str = ""
+    source_duration: float = 0.0
+    source_uri: str = ""
+    discrepancy_type: str = "UNMATCHED"  # "UNMATCHED", "AMBIGUOUS", "API_ERROR", "SKIPPED_POLICY"
+    confidence_score: float = 0.0
+    confidence_tier: str = "NO_MATCH"
+    rationale: str = ""
+    matched_title: Optional[str] = None
+    matched_artist: Optional[str] = None
+    matched_video_id: Optional[str] = None
+    alternatives: List[Dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def handle_legacy_or_object_inputs(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "source_track" in data and data["source_track"]:
+                st = data["source_track"]
+                if hasattr(st, "name"):
+                    data.setdefault("source_name", st.name or "")
+                    data.setdefault("source_artist", st.artist or "")
+                    data.setdefault("source_album", getattr(st, "album", "") or "")
+                    data.setdefault("source_duration", getattr(st, "duration_seconds", 0.0) or 0.0)
+                    data.setdefault("source_uri", getattr(st, "uri", "") or "")
+            if "reason" in data and not data.get("rationale"):
+                data["rationale"] = data["reason"]
+            if "matched_candidate" in data and data["matched_candidate"]:
+                mc = data["matched_candidate"]
+                if hasattr(mc, "title"):
+                    data.setdefault("matched_title", mc.title)
+                    data.setdefault("matched_artist", mc.artist)
+                    data.setdefault("matched_video_id", getattr(mc, "video_id", None))
+            if "alternative_candidates" in data and data["alternative_candidates"]:
+                alts = data["alternative_candidates"]
+                serialized_alts = []
+                for a in alts:
+                    if hasattr(a, "model_dump"):
+                        serialized_alts.append(a.model_dump())
+                    elif isinstance(a, dict):
+                        serialized_alts.append(a)
+                data.setdefault("alternatives", serialized_alts)
+        return data
+
 class SyncReport(BaseModel):
     job_id: str
+    destination: str = "youtube"
     mirror_id: Optional[str] = None
     playlist_name: str
     yt_playlist_url: str
-    status: str = "COMPLETED" # "COMPLETED", "COMPLETED_WITH_WARNINGS", "PARTIAL_SUCCESS", "FAILED"
+    status: str = "COMPLETED"  # "COMPLETED", "PARTIAL_SUCCESS", "IN_SYNC", "FAILED", "CANCELLED"
+    outcome: TransferOutcome = TransferOutcome.COMPLETE_SUCCESS
     total_source_tracks: int = 0
     total_synced_tracks: int = 0
     already_synchronized_tracks: int = 0
@@ -254,4 +327,13 @@ class SyncReport(BaseModel):
     duration_seconds: float = 0.0
     details: List[Dict[str, Any]] = Field(default_factory=list)
     unmatched_items: List[Dict[str, Any]] = Field(default_factory=list)
+    discrepancies: List[TrackDiscrepancy] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
+
+    @property
+    def is_complete(self) -> bool:
+        return (self.total_synced_tracks + self.already_synchronized_tracks) >= self.total_source_tracks and len(self.discrepancies) == 0
+
+    @property
+    def discrepancy_count(self) -> int:
+        return len(self.discrepancies) if self.discrepancies else self.unmatched_tracks
