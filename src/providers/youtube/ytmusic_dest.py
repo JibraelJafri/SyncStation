@@ -1,3 +1,4 @@
+import os
 import time
 import random
 from typing import List, Optional, Dict, Any
@@ -22,9 +23,12 @@ class YouTubeMusicDestination(MusicDestination):
             return
         try:
             self.connection_state = ConnectionState.CONNECTING
+            proxy_val = (self.settings.get("proxy") or os.environ.get("YOUTUBE_PROXY") or "").strip()
+            proxies_dict = {"http": proxy_val, "https": proxy_val} if proxy_val else None
             self.client = YTMusic(
                 auth=self.settings["headers"],
-                user=self.settings.get("client_id") or None
+                user=self.settings.get("client_id") or None,
+                proxies=proxies_dict
             )
             self.connection_state = ConnectionState.CONNECTED
         except Exception as e:
@@ -220,13 +224,26 @@ class YouTubeMusicDestination(MusicDestination):
 
         return added_count
 
-    def remove_tracks_from_playlist(self, playlist_id: str, tracks_to_remove: List[Dict[str, Any]]) -> int:
+    def remove_tracks_from_playlist(self, playlist_id: str, tracks_to_remove: Any) -> int:
         """Remove tracks from destination playlist using ytmusicapi remove_playlist_items."""
         if not self.client or not tracks_to_remove:
             return 0
+
+        formatted = []
+        for item in tracks_to_remove:
+            if isinstance(item, str):
+                formatted.append({"videoId": item})
+            elif isinstance(item, dict):
+                formatted.append(item)
+            elif hasattr(item, "id"):
+                formatted.append({"videoId": item.id})
+
+        if not formatted:
+            return 0
+
         try:
-            self._execute_with_backoff(self.client.remove_playlist_items, playlist_id, tracks_to_remove)
-            return len(tracks_to_remove)
+            self._execute_with_backoff(self.client.remove_playlist_items, playlist_id, formatted)
+            return len(formatted)
         except Exception as e:
             logger.error(f"Error removing tracks from playlist {playlist_id}: {e}")
             return 0
