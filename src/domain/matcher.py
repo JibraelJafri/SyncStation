@@ -1,3 +1,4 @@
+import re
 from typing import List, Tuple, Optional
 from rapidfuzz import fuzz
 
@@ -7,8 +8,28 @@ from src.domain.normalizer import (
     strip_edition_noise,
     extract_title_and_featured,
     normalize_artist,
-    extract_track_flags
+    extract_track_flags,
+    extract_part_indicator
 )
+
+def is_artist_match(sa: str, ca: str) -> bool:
+    """Accurately compare two artist tokens with length and boundary awareness."""
+    if not sa or not ca:
+        return False
+    clean_sa = re.sub(r"[^\w]", "", sa)
+    clean_ca = re.sub(r"[^\w]", "", ca)
+    if clean_sa == clean_ca:
+        return True
+    # For very short artist names (<= 4 chars, e.g. HER, U2, NEU, CHER, EVE), reject fuzzy edit distance
+    if min(len(clean_sa), len(clean_ca)) <= 4:
+        return False
+    if fuzz.ratio(sa, ca) >= 85:
+        return True
+    if len(sa) >= 5 and re.search(r'\b' + re.escape(sa) + r'\b', ca):
+        return True
+    if len(ca) >= 5 and re.search(r'\b' + re.escape(ca) + r'\b', sa):
+        return True
+    return False
 
 class MatchingEngine:
     @staticmethod
@@ -34,16 +55,41 @@ class MatchingEngine:
 
     @classmethod
     def score_candidate(cls, source: Track, candidate: CandidateTrack) -> Tuple[float, str]:
+        # 0. ISRC Exact Match Check (100% confidence for identical master recordings)
+        cand_isrc = getattr(candidate, "isrc", None)
+        if source.isrc and cand_isrc:
+            clean_src_isrc = source.isrc.replace("-", "").strip().upper()
+            clean_cand_isrc = str(cand_isrc).replace("-", "").strip().upper()
+            if clean_src_isrc == clean_cand_isrc:
+                dur_score = cls.calculate_duration_score(source.duration_seconds, candidate.duration_seconds)
+                if dur_score >= 0.85:
+                    return 1.0, f"Exact ISRC match ({clean_src_isrc})"
+
         # 1. Clean Title Matching
         src_clean_title, src_feat = extract_title_and_featured(source.name)
         cand_clean_title, cand_feat = extract_title_and_featured(candidate.title)
 
         title_ratio = fuzz.ratio(src_clean_title.lower(), cand_clean_title.lower()) / 100.0
-        token_ratio = fuzz.token_set_ratio(src_clean_title.lower(), cand_clean_title.lower()) / 100.0
         token_sort = fuzz.token_sort_ratio(src_clean_title.lower(), cand_clean_title.lower()) / 100.0
-        title_score = max(title_ratio, token_ratio, token_sort)
 
-        # 2. Artist Matching
+        # Token set ratio with length & word count damping
+        raw_token_set = fuzz.token_set_ratio(src_clean_title.lower(), cand_clean_title.lower()) / 100.0
+        src_tokens = [t for t in re.split(r"[^\w]+", src_clean_title.lower()) if t]
+        cand_tokens = [t for t in re.split(r"[^\w]+", cand_clean_title.lower()) if t]
+
+        t_min = min(len(src_tokens), len(cand_tokens))
+        t_max = max(len(src_tokens), len(cand_tokens), 1)
+        token_len_ratio = t_min / t_max
+        char_len_ratio = min(len(src_clean_title), len(cand_clean_title)) / max(len(src_clean_title), len(cand_clean_title), 1)
+
+        # Damp subset matching when lengths diverge (prevents "Run" matching "Run For Your Life")
+        damped_token_set = raw_token_set * (0.35 + 0.65 * (0.5 * token_len_ratio + 0.5 * char_len_ratio))
+        if (len(src_tokens) == 1 and len(cand_tokens) > 1) or (len(cand_tokens) == 1 and len(src_tokens) > 1):
+            damped_token_set = min(damped_token_set, 0.50)
+
+        title_score = max(title_ratio, token_sort, damped_token_set)
+
+        # 2. Artist Matching with Token & Boundary Awareness
         src_artists = normalize_artist(source.artist) + [f.lower() for f in src_feat]
         cand_artists = normalize_artist(candidate.artist) + [f.lower() for f in cand_feat]
 
@@ -54,14 +100,17 @@ class MatchingEngine:
             matches = 0
             for sa in src_artists:
                 for ca in cand_artists:
-                    if fuzz.ratio(sa, ca) >= 80 or sa in ca or ca in sa:
+                    if is_artist_match(sa, ca):
                         matches += 1
                         break
             if matches > 0:
                 artist_score = min(1.0, 0.75 + (matches * 0.25))
             else:
-                token_art = fuzz.token_set_ratio(source.artist.lower(), candidate.artist.lower()) / 100.0
-                artist_score = token_art
+                token_art = fuzz.token_sort_ratio(source.artist.lower(), candidate.artist.lower()) / 100.0
+                if token_art >= 0.80:
+                    artist_score = token_art * 0.85
+                else:
+                    artist_score = token_art * 0.25  # Heavily discount divergent artists
 
         # 3. Duration Score
         dur_score = cls.calculate_duration_score(source.duration_seconds, candidate.duration_seconds)
@@ -72,6 +121,13 @@ class MatchingEngine:
 
         attribute_multiplier = 1.0
         mismatch_reasons = []
+
+        # Movement / Part Designation Check (e.g. Pt 1 vs Pt 2)
+        src_part = extract_part_indicator(source.name)
+        cand_part = extract_part_indicator(candidate.title)
+        if src_part and cand_part and src_part != cand_part:
+            attribute_multiplier *= 0.30
+            mismatch_reasons.append(f"Movement/Part mismatch ({src_part.upper()} vs {cand_part.upper()})")
 
         # Live Mismatch Penalty
         if not src_flags["is_live"] and cand_flags["is_live"]:
@@ -95,6 +151,21 @@ class MatchingEngine:
             attribute_multiplier *= 0.70
             mismatch_reasons.append("Acoustic mismatch")
 
+        # Cover Mismatch Penalty
+        if not src_flags.get("is_cover") and cand_flags.get("is_cover"):
+            attribute_multiplier *= 0.35
+            mismatch_reasons.append("Unwanted Cover version")
+
+        # Parody Mismatch Penalty
+        if not src_flags.get("is_parody") and cand_flags.get("is_parody"):
+            attribute_multiplier *= 0.20
+            mismatch_reasons.append("Unwanted Parody version")
+
+        # Sped Up / Slowed / Nightcore Penalty
+        if not src_flags.get("is_sped_slow") and cand_flags.get("is_sped_slow"):
+            attribute_multiplier *= 0.30
+            mismatch_reasons.append("Sped Up/Slowed modification")
+
         # Result Type Multiplier
         type_multiplier = 1.0 if candidate.result_type == "song" else 0.90
 
@@ -105,11 +176,23 @@ class MatchingEngine:
             (dur_score * 0.20)
         ) * attribute_multiplier * type_multiplier
 
+        # Gating 1: Artist Identity Gate
+        # If artist similarity is poor (< 0.50), this is a different artist singing a song with the same title
+        if artist_score < 0.50:
+            artist_gate = max(0.0, artist_score / 0.50)
+            weighted_score *= artist_gate
+
+        # Gating 2: Title Identity Gate
+        # If clean title similarity is weak (< 0.60), this is likely a different song from the same album/artist
+        if title_score < 0.60:
+            title_gate = max(0.0, title_score / 0.60)
+            weighted_score *= title_gate
+
         weighted_score = max(0.0, min(1.0, weighted_score))
 
-        # Build Rationale
+        # Build ASCII-Safe Rationale
         dur_diff = int(abs(source.duration_seconds - candidate.duration_seconds)) if source.duration_seconds > 0 and candidate.duration_seconds > 0 else None
-        dur_note = f"Δ={dur_diff}s" if dur_diff is not None else "no dur"
+        dur_note = f"diff={dur_diff}s" if dur_diff is not None else "no dur"
         type_note = "Song" if candidate.result_type == "song" else "Video"
         rationale_parts = [
             f"Title: {int(title_score*100)}%",
@@ -130,7 +213,7 @@ class MatchingEngine:
                 matched_track=None,
                 confidence_score=0.0,
                 confidence_tier=ConfidenceTier.NO_MATCH,
-                rationale="No search candidates found on YouTube Music",
+                rationale="No search candidates found on destination catalog",
                 alternative_candidates=[],
                 is_accepted=False
             )

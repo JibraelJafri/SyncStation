@@ -1,6 +1,6 @@
 import re
 import unicodedata
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 
 # Common edition suffixes and noisy patterns
 EDITION_PATTERNS = [
@@ -44,12 +44,29 @@ EDITION_PATTERNS = [
     re.compile(r"\s*\[.*?Edition\]", re.IGNORECASE),
     re.compile(r"\s*[-/|]\s*Stereo(?:\s+Version)?", re.IGNORECASE),
     re.compile(r"\s*[-/|]\s*Mono(?:\s+Version)?", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*(?:Official\s+)?(?:Music\s+)?Video\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*(?:Official\s+)?Audio\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*(?:Official\s+)?Visuali[zs]er(?:\s+Video)?\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*(?:Official\s+)?Lyric(?:\s+Video)?\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*Lyrics\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*Album\s+Version\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*Clean(?:\s+Version)?\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*Explicit(?:\s+Version)?\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*Full\s+(?:Track|Audio|Song)\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*HQ\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*(?:Mono|Stereo)(?:\s+Version)?\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[-/|]\s*Acoustic(?:\s*;.*)?", re.IGNORECASE),
+    re.compile(r"\s*[-/|;]\s*Live\s+(?:at|from|in)\s+.*", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*Live\s+(?:at|from|in)\s+.*?[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*[\(\[]\s*\d{4}\s+Remaster\s*[\]\)]", re.IGNORECASE),
+    re.compile(r"\s*;\s*\d{4}\s+Remaster.*", re.IGNORECASE),
 ]
 
 FEAT_PATTERNS = [
     re.compile(r"\s*[\(\[]\s*(?:feat(?:\.|uring)?|ft\.?|with)\s+.*?[\]\)]", re.IGNORECASE),
     re.compile(r"\s*[-/|]\s*(?:feat(?:\.|uring)?|ft\.?|with)\s+.*", re.IGNORECASE),
-    re.compile(r"\s+(?:feat(?:\.|uring)?|ft\.?|with)\s+.*", re.IGNORECASE),
+    re.compile(r"\s+(?:feat(?:\.|uring)?|ft\.?)\s+.*", re.IGNORECASE),
+    re.compile(r"\s+with\s+(?!(?:me|you|us|them|him|her|it|the|a|an|my|your|our|somebody|someone|nobody)\b).+", re.IGNORECASE),
 ]
 
 LIVE_PATTERNS = [
@@ -79,6 +96,25 @@ INSTRUMENTAL_PATTERNS = [
     re.compile(r"\bBacking\s+Track\b", re.IGNORECASE),
 ]
 
+COVER_PATTERNS = [
+    re.compile(r"\bCover(?:\s+by|\s+version)?\b", re.IGNORECASE),
+    re.compile(r"\bTribute(?:\s+to)?\b", re.IGNORECASE),
+]
+
+PARODY_PATTERNS = [
+    re.compile(r"\bParody\b", re.IGNORECASE),
+]
+
+SPED_SLOW_PATTERNS = [
+    re.compile(r"\bSped\s+Up\b", re.IGNORECASE),
+    re.compile(r"\bSlowed(?:\s*\+\s*Reverb)?\b", re.IGNORECASE),
+    re.compile(r"\bNightcore\b", re.IGNORECASE),
+    re.compile(r"\b8D\s+Audio\b", re.IGNORECASE),
+    re.compile(r"\bChopped\s+and\s+Screwed\b", re.IGNORECASE),
+]
+
+PART_PATTERN = re.compile(r"\b(?:part|pt\.?|volume|vol\.?|act|chapter)\s*([0-9ivxlcdm]+)\b", re.IGNORECASE)
+
 def normalize_unicode(text: str) -> str:
     """Strip diacritics and standardize typographic punctuation."""
     if not text:
@@ -90,14 +126,24 @@ def normalize_unicode(text: str) -> str:
     return text.strip()
 
 def extract_track_flags(title: str, artist: str = "") -> Dict[str, bool]:
-    """Detect special attributes: live, remix, acoustic, instrumental."""
+    """Detect special attributes: live, remix, acoustic, instrumental, cover, parody, sped_slow."""
     combined = f"{title} {artist}"
     return {
         "is_live": any(p.search(combined) for p in LIVE_PATTERNS),
         "is_remix": any(p.search(combined) for p in REMIX_PATTERNS),
         "is_acoustic": any(p.search(combined) for p in ACOUSTIC_PATTERNS),
         "is_instrumental": any(p.search(combined) for p in INSTRUMENTAL_PATTERNS),
+        "is_cover": any(p.search(combined) for p in COVER_PATTERNS),
+        "is_parody": any(p.search(combined) for p in PARODY_PATTERNS),
+        "is_sped_slow": any(p.search(combined) for p in SPED_SLOW_PATTERNS),
     }
+
+def extract_part_indicator(title: str) -> Optional[str]:
+    """Extract movement, part, or chapter designation (e.g. 'pt 1', 'part 2', 'vol 3')."""
+    m = PART_PATTERN.search(title)
+    if m:
+        return m.group(1).lower()
+    return None
 
 def strip_edition_noise(title: str) -> str:
     """Remove remastered / deluxe / anniversary labels from song title."""
@@ -129,7 +175,11 @@ def normalize_artist(artist: str) -> List[str]:
     if not artist:
         return []
     clean_art = normalize_unicode(artist)
-    parts = re.split(r",\s*|\s*&\s*|\s*/\s*|\s+x\s+|\s+vs\.?\s+|\s+with\s+", clean_art, flags=re.IGNORECASE)
+    parts = re.split(
+        r",\s*|\s*&\s*|\s*/\s*|\s+x\s+|\s+vs\.?\s+|\s+with\s+|\s+feat(?:\.|uring)?\s+|\s+ft\.?\s+",
+        clean_art,
+        flags=re.IGNORECASE
+    )
     return [p.strip().lower() for p in parts if p.strip()]
 
 def clean_query_string(artist: str, title: str) -> str:
