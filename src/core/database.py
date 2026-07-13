@@ -34,6 +34,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS mirrored_playlists (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            destination TEXT DEFAULT 'youtube',
             spotify_id TEXT,
             spotify_uri TEXT,
             spotify_url TEXT,
@@ -73,6 +74,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS sync_jobs (
             id TEXT PRIMARY KEY,
+            destination TEXT DEFAULT 'youtube',
             mirror_id TEXT,
             playlist_name TEXT NOT NULL,
             spotify_url_or_id TEXT NOT NULL,
@@ -112,6 +114,7 @@ def init_db():
             status TEXT DEFAULT 'PENDING',
             is_manual_override INTEGER DEFAULT 0,
             is_accepted INTEGER DEFAULT 1,
+            alternatives_json TEXT DEFAULT '[]',
             error TEXT,
             FOREIGN KEY (job_id) REFERENCES sync_jobs(id) ON DELETE CASCADE
         );
@@ -140,6 +143,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS sync_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            destination TEXT DEFAULT 'youtube',
             job_id TEXT NOT NULL,
             mirror_id TEXT,
             playlist_name TEXT NOT NULL,
@@ -194,6 +198,14 @@ def _run_migrations(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE sync_jobs ADD COLUMN current_thumbnail_url TEXT")
     if "eta_seconds" not in cols:
         conn.execute("ALTER TABLE sync_jobs ADD COLUMN eta_seconds INTEGER")
+    if "destination" not in cols:
+        conn.execute("ALTER TABLE sync_jobs ADD COLUMN destination TEXT DEFAULT 'youtube'")
+
+    # Check mirrored_playlists columns
+    cursor.execute("PRAGMA table_info(mirrored_playlists)")
+    mirror_cols = {row["name"] for row in cursor.fetchall()}
+    if "destination" not in mirror_cols:
+        conn.execute("ALTER TABLE mirrored_playlists ADD COLUMN destination TEXT DEFAULT 'youtube'")
 
     # Check matches_cache columns
     cursor.execute("PRAGMA table_info(matches_cache)")
@@ -206,6 +218,14 @@ def _run_migrations(conn: sqlite3.Connection):
     hist_cols = {row["name"] for row in cursor.fetchall()}
     if "mirror_id" not in hist_cols:
         conn.execute("ALTER TABLE sync_history ADD COLUMN mirror_id TEXT")
+    if "destination" not in hist_cols:
+        conn.execute("ALTER TABLE sync_history ADD COLUMN destination TEXT DEFAULT 'youtube'")
+
+    # Check sync_items columns
+    cursor.execute("PRAGMA table_info(sync_items)")
+    sync_cols = {row["name"] for row in cursor.fetchall()}
+    if "alternatives_json" not in sync_cols:
+        conn.execute("ALTER TABLE sync_items ADD COLUMN alternatives_json TEXT DEFAULT '[]'")
 
     # Clean up non-existent snapshots or temp test snapshots
     conn.execute("DELETE FROM snapshots_meta WHERE file_path LIKE '%Temp%' OR file_path LIKE '%pytest%'")
@@ -248,20 +268,21 @@ class DatabaseManager:
         yt_track_count: int = 0,
         policy_additions: str = "AUTO_ADD",
         policy_removals: str = "ASK_BEFORE_REMOVE",
-        policy_matching: str = "ASK_REVIEW"
+        policy_matching: str = "ASK_REVIEW",
+        destination: str = "youtube"
     ) -> MirroredPlaylist:
         mirror_id = str(uuid.uuid4())[:8]
         with get_db() as conn:
             conn.execute("""
             INSERT INTO mirrored_playlists (
-                id, name, spotify_id, spotify_uri, spotify_url,
+                id, name, destination, spotify_id, spotify_uri, spotify_url,
                 yt_playlist_id, yt_playlist_name, source_type, source_snapshot_id,
                 last_sync_status, spotify_track_count, yt_track_count,
                 sync_policy_additions, sync_policy_removals, sync_policy_matching,
                 last_synced_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_SYNC', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_SYNC', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """, (
-                mirror_id, name, spotify_id, spotify_uri, spotify_url,
+                mirror_id, name, destination, spotify_id, spotify_uri, spotify_url,
                 yt_playlist_id, yt_playlist_name, source_type, source_snapshot_id,
                 spotify_track_count, yt_track_count,
                 policy_additions, policy_removals, policy_matching
@@ -279,13 +300,19 @@ class DatabaseManager:
             return MirroredPlaylist(**dict(row))
 
     @staticmethod
-    def get_mirror_by_spotify(spotify_id_or_uri: str) -> Optional[MirroredPlaylist]:
+    def get_mirror_by_spotify(spotify_id_or_uri: str, destination: Optional[str] = None) -> Optional[MirroredPlaylist]:
         with get_db() as conn:
             cur = conn.cursor()
-            cur.execute("""
-            SELECT * FROM mirrored_playlists
-            WHERE spotify_id = ? OR spotify_uri = ? OR name = ?
-            """, (spotify_id_or_uri, spotify_id_or_uri, spotify_id_or_uri))
+            if destination:
+                cur.execute("""
+                SELECT * FROM mirrored_playlists
+                WHERE (spotify_id = ? OR spotify_uri = ? OR name = ?) AND destination = ?
+                """, (spotify_id_or_uri, spotify_id_or_uri, spotify_id_or_uri, destination))
+            else:
+                cur.execute("""
+                SELECT * FROM mirrored_playlists
+                WHERE spotify_id = ? OR spotify_uri = ? OR name = ?
+                """, (spotify_id_or_uri, spotify_id_or_uri, spotify_id_or_uri))
             row = cur.fetchone()
             return MirroredPlaylist(**dict(row)) if row else None
 
@@ -298,10 +325,13 @@ class DatabaseManager:
             return MirroredPlaylist(**dict(row)) if row else None
 
     @staticmethod
-    def list_mirrors() -> List[MirroredPlaylist]:
+    def list_mirrors(destination: Optional[str] = None) -> List[MirroredPlaylist]:
         with get_db() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM mirrored_playlists ORDER BY updated_at DESC")
+            if destination:
+                cur.execute("SELECT * FROM mirrored_playlists WHERE destination = ? ORDER BY updated_at DESC", (destination,))
+            else:
+                cur.execute("SELECT * FROM mirrored_playlists ORDER BY updated_at DESC")
             return [MirroredPlaylist(**dict(row)) for row in cur.fetchall()]
 
     @staticmethod
@@ -439,11 +469,22 @@ class DatabaseManager:
             conn.execute("DELETE FROM user_overrides WHERE id = ?", (override_id,))
 
     @staticmethod
-    def get_cached_match(query: str) -> Optional[Dict[str, Any]]:
+    def _make_match_cache_key(query: str, destination: str = "youtube") -> str:
+        dest_prefix = (destination or "youtube").lower().strip()
+        q_norm = query.lower().strip()
+        return f"{dest_prefix}:{q_norm}"
+
+    @staticmethod
+    def get_cached_match(query: str, destination: str = "youtube") -> Optional[Dict[str, Any]]:
         with get_db() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM matches_cache WHERE query_key = ?", (query.lower().strip(),))
+            key = DatabaseManager._make_match_cache_key(query, destination)
+            cur.execute("SELECT * FROM matches_cache WHERE query_key = ?", (key,))
             row = cur.fetchone()
+            if not row and (destination or "youtube").lower() == "youtube":
+                # Backward compatibility for existing legacy YouTube match entries
+                cur.execute("SELECT * FROM matches_cache WHERE query_key = ?", (query.lower().strip(),))
+                row = cur.fetchone()
             return dict(row) if row else None
 
     @staticmethod
@@ -455,9 +496,11 @@ class DatabaseManager:
         duration: float = 0.0,
         result_type: str = "song",
         score: float = 1.0,
-        isrc: str = None
+        isrc: str = None,
+        destination: str = "youtube"
     ):
         with get_db() as conn:
+            key = DatabaseManager._make_match_cache_key(query, destination)
             conn.execute("""
             INSERT INTO matches_cache (query_key, video_id, title, artist, duration_seconds, result_type, confidence_score, isrc)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -470,23 +513,39 @@ class DatabaseManager:
                 confidence_score = excluded.confidence_score,
                 isrc = COALESCE(excluded.isrc, matches_cache.isrc),
                 updated_at = CURRENT_TIMESTAMP
-            """, (query.lower().strip(), video_id, title, artist, duration, result_type, score, isrc))
+            """, (key, video_id, title, artist, duration, result_type, score, isrc))
 
     @staticmethod
-    def batch_get_cached_matches(queries: List[str]) -> Dict[str, Dict[str, Any]]:
+    def batch_get_cached_matches(queries: List[str], destination: str = "youtube") -> Dict[str, Dict[str, Any]]:
         if not queries:
             return {}
-        normalized = [q.lower().strip() for q in queries]
+        dest = (destination or "youtube").lower().strip()
+        keys_map = {DatabaseManager._make_match_cache_key(q, dest): q.lower().strip() for q in queries}
+        keys = list(keys_map.keys())
         results = {}
         with get_db() as conn:
             # Query in chunks of 500
-            for i in range(0, len(normalized), 500):
-                chunk = normalized[i:i + 500]
+            for i in range(0, len(keys), 500):
+                chunk = keys[i:i + 500]
                 placeholders = ",".join("?" for _ in chunk)
                 cur = conn.cursor()
                 cur.execute(f"SELECT * FROM matches_cache WHERE query_key IN ({placeholders})", chunk)
                 for row in cur.fetchall():
-                    results[row["query_key"]] = dict(row)
+                    orig_q = keys_map.get(row["query_key"])
+                    if orig_q:
+                        results[orig_q] = dict(row)
+            # Fallback for YouTube legacy records
+            if dest == "youtube":
+                missing = [q for q in queries if q.lower().strip() not in results]
+                if missing:
+                    norm_missing = [q.lower().strip() for q in missing]
+                    for i in range(0, len(norm_missing), 500):
+                        chunk = norm_missing[i:i + 500]
+                        placeholders = ",".join("?" for _ in chunk)
+                        cur = conn.cursor()
+                        cur.execute(f"SELECT * FROM matches_cache WHERE query_key IN ({placeholders})", chunk)
+                        for row in cur.fetchall():
+                            results[row["query_key"]] = dict(row)
         return results
 
     # ─── SYNC JOBS & RESUMABILITY DAO ────────────────────────────────────
@@ -498,15 +557,16 @@ class DatabaseManager:
         mode: str,
         total_tracks: int,
         mirror_id: str = None,
-        yt_playlist_id: str = None
+        yt_playlist_id: str = None,
+        destination: str = "youtube"
     ) -> None:
         with get_db() as conn:
             conn.execute("""
             INSERT INTO sync_jobs (
-                id, mirror_id, playlist_name, spotify_url_or_id,
+                id, destination, mirror_id, playlist_name, spotify_url_or_id,
                 yt_playlist_id, mode, status, total_tracks
-            ) VALUES (?, ?, ?, ?, ?, ?, 'ANALYZING', ?)
-            """, (job_id, mirror_id, playlist_name, spotify_url, yt_playlist_id, mode, total_tracks))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ANALYZING', ?)
+            """, (job_id, destination, mirror_id, playlist_name, spotify_url, yt_playlist_id, mode, total_tracks))
 
     @staticmethod
     def update_job_progress(
@@ -579,6 +639,77 @@ class DatabaseManager:
             """)
             return [dict(r) for r in cur.fetchall()]
 
+    @staticmethod
+    def get_latest_job() -> Optional[Dict[str, Any]]:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM sync_jobs ORDER BY created_at DESC LIMIT 1")
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def list_recent_jobs(limit: int = 10) -> List[Dict[str, Any]]:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM sync_jobs ORDER BY created_at DESC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    @staticmethod
+    def get_job_audit_summary(job_id: str) -> Dict[str, Any]:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+            SELECT
+                COUNT(*) as total,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'EXACT' THEN 1 ELSE 0 END), 0) as exact,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'HIGH' THEN 1 ELSE 0 END), 0) as high,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'PROBABLE' THEN 1 ELSE 0 END), 0) as probable,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'AMBIGUOUS' THEN 1 ELSE 0 END), 0) as ambiguous,
+                COALESCE(SUM(CASE WHEN confidence_tier = 'NO_MATCH' THEN 1 ELSE 0 END), 0) as no_match,
+                COALESCE(SUM(CASE WHEN is_manual_override = 1 THEN 1 ELSE 0 END), 0) as overrides,
+                COALESCE(SUM(CASE WHEN is_accepted = 1 THEN 1 ELSE 0 END), 0) as accepted,
+                COALESCE(SUM(CASE WHEN is_accepted = 0 THEN 1 ELSE 0 END), 0) as unaccepted
+            FROM sync_items WHERE job_id = ?
+            """, (job_id,))
+            row = cur.fetchone()
+            return dict(row) if row else {}
+
+    @staticmethod
+    def get_job_audit_items(
+        job_id: str,
+        tier: Optional[str] = None,
+        only_flagged: bool = False,
+        limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        with get_db() as conn:
+            cur = conn.cursor()
+            query = "SELECT * FROM sync_items WHERE job_id = ?"
+            params = [job_id]
+
+            if only_flagged:
+                query += " AND (confidence_tier IN ('AMBIGUOUS', 'NO_MATCH') OR is_accepted = 0)"
+            elif tier and tier != "ALL":
+                query += " AND confidence_tier = ?"
+                params.append(tier)
+
+            query += " ORDER BY track_index ASC LIMIT ?"
+            params.append(limit)
+
+            cur.execute(query, params)
+            items = []
+            for row in cur.fetchall():
+                d = dict(row)
+                raw_alts = d.get("alternatives_json")
+                if raw_alts:
+                    try:
+                        d["alternatives"] = json.loads(raw_alts)
+                    except Exception:
+                        d["alternatives"] = []
+                else:
+                    d["alternatives"] = []
+                items.append(d)
+            return items
+
     # ─── SYNC HISTORY & AUDIT DAO ────────────────────────────────────────
     @staticmethod
     def save_sync_history(
@@ -589,16 +720,17 @@ class DatabaseManager:
         synced_tracks: int,
         duration_sec: float,
         report: dict,
-        mirror_id: str = None
+        mirror_id: str = None,
+        destination: str = "youtube"
     ):
         with get_db() as conn:
             conn.execute("""
             INSERT INTO sync_history (
-                job_id, mirror_id, playlist_name, yt_playlist_id,
+                job_id, destination, mirror_id, playlist_name, yt_playlist_id,
                 total_tracks, synced_tracks, duration_seconds, report_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                job_id, mirror_id, playlist_name, yt_playlist_id,
+                job_id, destination, mirror_id, playlist_name, yt_playlist_id,
                 total_tracks, synced_tracks, duration_sec, json.dumps(report, default=str)
             ))
 
