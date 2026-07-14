@@ -29,6 +29,7 @@ class SpotifyExportSource(MusicSource):
         self.file_path = Path(file_path) if file_path else self._find_best_export_file()
         self._data: Optional[Dict[str, Any]] = None
         self._metadata: Optional[SpotifySnapshotMetadata] = None
+        self._cached_playlists: Optional[List[Playlist]] = None
         if self.file_path and self.file_path.exists():
             self._load_data()
 
@@ -67,6 +68,7 @@ class SpotifyExportSource(MusicSource):
         return candidates[0]
 
     def _load_data(self):
+        self._cached_playlists = None
         if not self.file_path or not self.file_path.exists():
             return
         try:
@@ -193,6 +195,9 @@ class SpotifyExportSource(MusicSource):
         return self._metadata
 
     def get_playlists(self) -> List[Playlist]:
+        if self._cached_playlists is not None:
+            return self._cached_playlists
+
         if not self._data:
             return []
 
@@ -224,6 +229,7 @@ class SpotifyExportSource(MusicSource):
                 snapshot_id=self.file_path.name if self.file_path else None
             ))
 
+        self._cached_playlists = playlists
         return playlists
 
     def get_playlist_tracks(self, playlist_id_or_name: str) -> Playlist:
