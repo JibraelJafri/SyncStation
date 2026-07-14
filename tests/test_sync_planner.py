@@ -136,9 +136,69 @@ def test_planner_extra_youtube_only_tracks():
         MirrorTrackManifest(mirror_id="m1", spotify_uri="spotify:track:1", spotify_name="Track 1", spotify_artist="Artist A", yt_video_id="yt_1", yt_title="Track 1", yt_artist="Artist A")
     ]
 
-    plan = SyncPlanner.generate_plan(source, dest_tracks, manifest_tracks=manifest)
+    policy = SyncPolicy(removals=RemovalPolicy.NEVER_REMOVE)
+    plan = SyncPlanner.generate_plan(source, dest_tracks, manifest_tracks=manifest, policy=policy)
     assert plan.extra_dest_count == 1
     extra_item = next(it for it in plan.items if it.destination_video_id == "yt_extra")
     assert extra_item.action == PlanAction.SKIP_TRACK
     assert "YouTube Music-only" in extra_item.rationale
+
+def test_planner_detects_and_prunes_duplicate_destination_tracks():
+    """Scenario: Deezer playlist has duplicate copies of Track 1 due to previous pagination issues."""
+    source = Playlist(
+        name="Workout",
+        tracks=[
+            Track(id="1", uri="spotify:track:1", name="Track 1", artist="Artist A")
+        ]
+    )
+    dest_tracks = [
+        Track(id="dz_1", name="Track 1", artist="Artist A"),
+        Track(id="dz_1", name="Track 1", artist="Artist A"),  # Duplicate 1
+        Track(id="dz_1", name="Track 1", artist="Artist A")   # Duplicate 2
+    ]
+    mirror = MirroredPlaylist(
+        id="m_dz",
+        name="Workout",
+        destination="deezer",
+        yt_playlist_id="dz_pl_123",
+        yt_playlist_name="Workout"
+    )
+
+    plan = SyncPlanner.generate_plan(source, dest_tracks, mirror=mirror)
+    assert plan.unchanged_count == 1
+    assert plan.removals_count == 2
+    duplicate_items = [it for it in plan.items if "Duplicate on Deezer" in (it.rationale or "")]
+    assert len(duplicate_items) == 2
+    assert duplicate_items[0].action == PlanAction.REMOVE_TRACK
+    assert duplicate_items[0].destination_video_id == "dz_1"
+
+def test_planner_destination_only_tracks_ask_before_remove():
+    """Scenario: Track is on Deezer but never in Spotify, policy is ASK_BEFORE_REMOVE."""
+    source = Playlist(
+        name="Focus",
+        tracks=[
+            Track(id="1", uri="spotify:track:1", name="Track 1", artist="Artist A")
+        ]
+    )
+    dest_tracks = [
+        Track(id="dz_1", name="Track 1", artist="Artist A"),
+        Track(id="dz_extra", name="Outdated Track", artist="Old Artist")
+    ]
+    mirror = MirroredPlaylist(
+        id="m_dz",
+        name="Focus",
+        destination="deezer",
+        yt_playlist_id="dz_pl_456",
+        yt_playlist_name="Focus"
+    )
+
+    policy = SyncPolicy(removals=RemovalPolicy.ASK_BEFORE_REMOVE)
+    plan = SyncPlanner.generate_plan(source, dest_tracks, mirror=mirror, policy=policy)
+    assert plan.unchanged_count == 1
+    assert plan.removals_count == 1
+    remove_item = next(it for it in plan.items if it.destination_video_id == "dz_extra")
+    assert remove_item.action == PlanAction.REMOVE_TRACK
+    assert remove_item.requires_user_review is True
+    assert "not in Spotify" in remove_item.rationale
+
 
