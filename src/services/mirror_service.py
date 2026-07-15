@@ -15,6 +15,8 @@ from src.core.database import DatabaseManager, get_db
 from src.domain.discovery_engine import MirrorDiscoveryEngine
 from src.providers.spotify.unified_provider import UnifiedSpotifyProvider
 from src.providers.youtube.ytmusic_dest import YouTubeMusicDestination
+from src.providers.base import MusicDestination
+from src.providers.factory import DestinationRegistry
 from src.domain.normalizer import clean_query_string
 from src.core.logger import logger
 
@@ -60,22 +62,23 @@ class MirrorService:
         mirrors_by_name = {m.name.lower().strip(): m for m in mirrors}
         mirrors_by_sp_id = {m.spotify_id: m for m in mirrors if m.spotify_id}
 
-        yt_dest = YouTubeMusicDestination()
-        yt_available = yt_dest.is_available()
+        dest_name = DestinationRegistry.get_active_destination_name()
+        dest = DestinationRegistry.get_destination(dest_name)
+        dest_available = dest.is_available() if hasattr(dest, "is_available") else False
         yt_library = []
-        if yt_available:
+        if dest_available:
             try:
-                yt_library = yt_dest.get_library_playlists(limit=200)
+                yt_library = dest.get_library_playlists(limit=200)
             except Exception as e:
-                logger.warning(f"Could not load YT library for discovery: {e}")
+                logger.warning(f"Could not load {dest_name} library for discovery: {e}")
 
-        # Index YouTube playlists by playlistId and cleaned title
+        # Index destination playlists by playlistId and cleaned title
         yt_by_id = {}
         yt_by_name = {}
         for y in yt_library:
-            pid = y.get("playlistId")
+            pid = y.get("playlistId") or y.get("id")
             if pid:
-                yt_by_id[pid] = y
+                yt_by_id[str(pid)] = y
             title = y.get("title", "").strip()
             if title:
                 yt_by_name[title.lower()] = y
@@ -253,58 +256,66 @@ class MirrorService:
         Populate initial manifest by matching Spotify tracks with actual YouTube destination playlist tracks.
         """
         try:
-            sp_pl = sp_provider.get_playlist_tracks(mirror.name or mirror.spotify_id, source_type=source_type, file_path=file_path)
-            yt_dest = YouTubeMusicDestination()
-            yt_pl = yt_dest.get_playlist(mirror.yt_playlist_id) if yt_dest.is_available() else None
-            yt_tracks = yt_pl.tracks if yt_pl else []
+            try:
+                sp_pl = sp_provider.get_playlist_tracks(mirror.name or mirror.spotify_id, source_type=source_type, file_path=file_path)
+            except TypeError:
+                sp_pl = sp_provider.get_playlist_tracks(mirror.name or mirror.spotify_id)
+            dest_name = mirror.destination or "youtube"
+            dest = DestinationRegistry.get_destination(dest_name)
+            dest_pl = dest.get_playlist(mirror.yt_playlist_id) if (hasattr(dest, "is_available") and dest.is_available()) else None
+            dest_tracks = dest_pl.tracks if dest_pl else []
 
-            # Index YouTube tracks by normalized query
-            yt_by_query = {}
-            for yt_t in yt_tracks:
-                q = clean_query_string(yt_t.artist, yt_t.name).lower()
+            # Index destination tracks by normalized query
+            dest_by_query = {}
+            for dt in dest_tracks:
+                q = clean_query_string(dt.artist, dt.name).lower()
                 if q:
-                    yt_by_query[q] = yt_t
+                    dest_by_query[q] = dt
 
             manifest_items = []
             for t in sp_pl.tracks:
                 q = clean_query_string(t.artist, t.name).lower()
-                matched_yt_track = yt_by_query.get(q)
-                cached = DatabaseManager.get_cached_match(q)
+                matched_dest_track = dest_by_query.get(q)
+                cached = DatabaseManager.get_cached_match(q, destination=dest_name)
 
                 video_id = None
-                yt_title = None
-                yt_artist = None
+                dest_title = None
+                dest_artist = None
 
-                if matched_yt_track:
-                    video_id = matched_yt_track.id
-                    yt_title = matched_yt_track.name
-                    yt_artist = matched_yt_track.artist
+                if matched_dest_track:
+                    video_id = matched_dest_track.id
+                    dest_title = matched_dest_track.name
+                    dest_artist = matched_dest_track.artist
                     # Cache the discovered match
                     DatabaseManager.save_cached_match(
                         query=q,
                         video_id=video_id,
-                        title=yt_title,
-                        artist=yt_artist,
-                        duration=matched_yt_track.duration_seconds,
+                        title=dest_title,
+                        artist=dest_artist,
+                        duration=matched_dest_track.duration_seconds,
                         result_type="song",
                         score=1.0,
-                        isrc=t.isrc
+                        isrc=t.isrc,
+                        destination=dest_name
                     )
                 elif cached:
                     video_id = cached["video_id"]
-                    yt_title = cached.get("title") or t.name
-                    yt_artist = cached.get("artist") or t.artist
+                    dest_title = cached.get("title") or t.name
+                    dest_artist = cached.get("artist") or t.artist
 
+                # Guard against cross-destination ID contamination
                 if video_id:
+                    if dest_name == "deezer" and not str(video_id).strip().isdigit():
+                        continue
                     manifest_items.append({
                         "spotify_uri": t.uri or f"spotify:track:{t.id}",
                         "spotify_name": t.name,
                         "spotify_artist": t.artist,
                         "spotify_album": t.album,
                         "spotify_duration": t.duration_seconds,
-                        "yt_video_id": video_id,
-                        "yt_title": yt_title or t.name,
-                        "yt_artist": yt_artist or t.artist
+                        "yt_video_id": str(video_id),
+                        "yt_title": dest_title or t.name,
+                        "yt_artist": dest_artist or t.artist
                     })
 
             if manifest_items:
@@ -352,19 +363,23 @@ class MirrorService:
         spotify_identifier: str,
         yt_playlist_id: str,
         source_type: str = "export",
-        file_path: Optional[str] = None
+        file_path: Optional[str] = None,
+        destination: Optional[MusicDestination] = None,
+        destination_name: Optional[str] = None
     ) -> MirroredPlaylist:
         """
-        Link an existing Spotify playlist with an existing YouTube Music playlist,
-        fetching existing tracks from YouTube to populate the manifest accurately.
+        Link an existing Spotify playlist with an existing destination playlist,
+        fetching existing tracks from destination to populate the manifest accurately.
         """
         sp_provider = UnifiedSpotifyProvider(default_source_type=source_type, file_path=file_path)
         sp_pl = sp_provider.get_playlist_tracks(spotify_identifier, source_type=source_type, file_path=file_path)
         
-        yt_dest = YouTubeMusicDestination()
-        yt_pl = yt_dest.get_playlist(yt_playlist_id)
-        yt_name = yt_pl.name if yt_pl else sp_pl.name
-        yt_track_count = len(yt_pl.tracks) if yt_pl else len(sp_pl.tracks)
+        dest = destination or DestinationRegistry.get_destination(destination_name)
+        dest_canonical = destination_name or ("deezer" if "deezer" in dest.__class__.__name__.lower() else "youtube")
+        
+        live_pl = dest.get_playlist(yt_playlist_id)
+        dest_name = live_pl.name if live_pl else sp_pl.name
+        dest_track_count = len(live_pl.tracks) if live_pl else len(sp_pl.tracks)
 
         # Check if mirror already exists
         existing = DatabaseManager.get_mirror_by_yt(yt_playlist_id)
@@ -375,17 +390,18 @@ class MirrorService:
         mirror = DatabaseManager.create_mirror(
             name=sp_pl.name,
             yt_playlist_id=yt_playlist_id,
-            yt_playlist_name=yt_name,
+            yt_playlist_name=dest_name,
             spotify_id=sp_pl.id,
             spotify_uri=sp_pl.uri,
             source_type=source_type,
             source_snapshot_id=sp_pl.snapshot_id,
             spotify_track_count=len(sp_pl.tracks),
-            yt_track_count=yt_track_count
+            yt_track_count=dest_track_count,
+            destination=dest_canonical
         )
 
         cls._backfill_mirror_manifest(mirror, sp_provider, source_type, file_path)
-        logger.info(f"Successfully established mirror link '{mirror.name}' ↔ '{yt_playlist_id}'")
+        logger.info(f"Successfully established mirror link '{mirror.name}' ↔ '{yt_playlist_id}' ({dest_canonical})")
         return mirror
 
     @classmethod
@@ -411,20 +427,9 @@ class MirrorService:
     def refresh_mirror_deltas(cls, source_type: str = "export", file_path: Optional[str] = None) -> List[MirroredPlaylist]:
         sp_provider = UnifiedSpotifyProvider(default_source_type=source_type, file_path=file_path)
         mirrors = DatabaseManager.list_mirrors()
-        
-        yt_dest = YouTubeMusicDestination()
-        yt_library = []
-        if yt_dest.is_available():
-            try:
-                yt_library = yt_dest.get_library_playlists(limit=200)
-            except Exception as e:
-                logger.warning(f"Could not load YT library for delta refresh: {e}")
-
-        yt_by_id = {y.get("playlistId"): y for y in yt_library if y.get("playlistId")}
-        yt_by_name = {y.get("title", "").strip().lower(): y for y in yt_library if y.get("title")}
-
         for mirror in mirrors:
             try:
+                dest = DestinationRegistry.get_destination(mirror.destination or "youtube")
                 sp_pl = sp_provider.get_playlist_tracks(mirror.name or mirror.spotify_id, source_type=mirror.source_type, file_path=file_path)
                 manifest = DatabaseManager.get_manifest_tracks(mirror.id)
                 if not manifest:
@@ -438,17 +443,11 @@ class MirrorService:
                 new_additions = len(sp_uris - manifest_uris)
                 new_removals = len(manifest_uris - sp_uris)
 
-                matched_yt = yt_by_id.get(mirror.yt_playlist_id) or yt_by_name.get(mirror.name.lower().strip())
-                yt_cnt = mirror.yt_track_count or len(sp_tracks)
-                if matched_yt:
-                    cnt_raw = str(matched_yt.get("count", "0")).replace(",", "").replace(".", "")
-                    try:
-                        yt_cnt = int(re.search(r"\d+", cnt_raw).group(0)) if re.search(r"\d+", cnt_raw) else yt_cnt
-                    except Exception:
-                        pass
+                live_pl = dest.get_playlist(mirror.yt_playlist_id) if hasattr(dest, "get_playlist") else None
+                dest_cnt = live_pl.track_count if live_pl else (mirror.yt_track_count or len(sp_tracks))
 
-                if yt_cnt < len(sp_tracks):
-                    new_additions = max(new_additions, len(sp_tracks) - yt_cnt)
+                if dest_cnt < len(sp_tracks):
+                    new_additions = max(new_additions, len(sp_tracks) - dest_cnt)
 
                 status = MirrorStatus.IN_SYNC if (new_additions == 0 and new_removals == 0) else MirrorStatus.CHANGES_DETECTED
 
@@ -456,7 +455,7 @@ class MirrorService:
                     mirror.id,
                     status=status.value,
                     spotify_count=len(sp_tracks),
-                    yt_count=yt_cnt,
+                    yt_count=dest_cnt,
                     delta_added=new_additions,
                     delta_removed=new_removals
                 )
