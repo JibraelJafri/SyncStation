@@ -26,8 +26,10 @@ def test_deleted_yt_playlist_auto_heals():
 
     plan = service.generate_sync_plan(mirror.id, destination=mock_dest, source=mock_source)
     assert plan is None
-    # Verify stale mirror was unlinked/deleted from DB
-    assert DatabaseManager.get_mirror(mirror.id) is None
+    # Verify mirror was preserved and marked as UNREACHABLE instead of destructively deleted
+    updated_mirror = DatabaseManager.get_mirror(mirror.id)
+    assert updated_mirror is not None
+    assert updated_mirror.last_sync_status == MirrorStatus.UNREACHABLE
 
 def test_add_tracks_to_playlist_breaks_on_404():
     """Test that chunk upload loop halts immediately on HTTP 404 error."""

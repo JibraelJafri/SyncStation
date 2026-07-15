@@ -14,14 +14,15 @@ from src.services.sync_service import SyncService
 from src.providers.base import MusicSource, MusicDestination
 
 class DummySource(MusicSource):
-    def __init__(self, tracks):
+    def __init__(self, tracks, name="Dummy Playlist"):
         self._tracks = tracks
+        self._name = name
 
     def get_playlists(self):
-        return [Playlist(id="dummy", name="Dummy Playlist", track_count=len(self._tracks), tracks=self._tracks)]
+        return [Playlist(id="dummy", name=self._name, track_count=len(self._tracks), tracks=self._tracks)]
 
     def get_playlist_tracks(self, identifier):
-        return Playlist(id="dummy", name="Dummy Playlist", track_count=len(self._tracks), tracks=self._tracks)
+        return Playlist(id="dummy", name=self._name, track_count=len(self._tracks), tracks=self._tracks)
 
     def get_liked_tracks(self):
         return self._tracks
@@ -138,3 +139,79 @@ def test_delta_sync_idempotency_no_duplicate_tracks():
     # Manifest should now have 3 tracks
     manifest = DatabaseManager.get_manifest_tracks(mirror_id)
     assert len(manifest) == 3
+
+def test_delta_sync_reconciles_removals_on_remote_destination():
+    init_db()
+    source_tracks = [
+        Track(id="s1", uri="spotify:track:s1", name="Alpha Song", artist="Alpha Artist", duration_seconds=180.0),
+        Track(id="s2", uri="spotify:track:s2", name="Beta Song", artist="Beta Artist", duration_seconds=200.0)
+    ]
+    source = DummySource(source_tracks, name="Removal Playlist")
+    dest = MockYTDestination()
+    dest.remove_tracks_from_playlist = MagicMock(return_value=1)
+    sync_svc = SyncService()
+
+    # 1. Initial transfer
+    job = sync_svc.analyze_for_transfer(source, "Removal Playlist", destination=dest)
+    transfer_report = sync_svc.execute_transfer(job.id, destination=dest)
+    mirror_id = transfer_report.mirror_id
+
+    # 2. Source removes Beta Song (leaving only Alpha Song)
+    remaining_source = DummySource([source_tracks[0]], name="Removal Playlist")
+
+    # 3. Delta plan with MIRROR_REMOVALS
+    from src.core.models import SyncPolicy, RemovalPolicy
+    policy = SyncPolicy(removals=RemovalPolicy.MIRROR_REMOVALS)
+    plan = sync_svc.generate_sync_plan(mirror_id, destination=dest, source=remaining_source, policy=policy)
+
+    assert plan.removals_count == 1
+    assert plan.unchanged_count == 1
+
+    # 4. Execute delta sync
+    report = sync_svc.execute_delta_sync(mirror_id, plan=plan, destination=dest, source=remaining_source)
+
+    # Verify dest.remove_tracks_from_playlist was called
+    assert dest.remove_tracks_from_playlist.called
+    assert report.total_synced_tracks == 0
+
+    # Manifest should now only contain Alpha Song
+    manifest = DatabaseManager.get_manifest_tracks(mirror_id)
+    assert len(manifest) == 1
+    assert manifest[0].spotify_uri == "spotify:track:s1"
+
+def test_delta_sync_with_unmatched_and_ambiguous_discrepancies():
+    init_db()
+    source_tracks = [
+        Track(id="s1", uri="spotify:track:s1", name="Track 1", artist="Artist 1", duration_seconds=180.0)
+    ]
+    source = DummySource(source_tracks, name="Discrepancy Playlist")
+    dest = MockYTDestination()
+    sync_svc = SyncService()
+
+    # Initial transfer
+    job = sync_svc.analyze_for_transfer(source, "Discrepancy Playlist", destination=dest)
+    transfer_report = sync_svc.execute_transfer(job.id, destination=dest)
+    mirror_id = transfer_report.mirror_id
+
+    # Add 2 new tracks: one that has 0 candidates (UNMATCHED) and one that returns candidates
+    updated_tracks = source_tracks + [
+        Track(id="s2", uri="spotify:track:s2", name="Unmatched Song", artist="Unknown Artist", duration_seconds=150.0)
+    ]
+    updated_source = DummySource(updated_tracks, name="Discrepancy Playlist")
+
+    # Mock search_candidates to return empty for unmatched song
+    orig_search = dest.search_candidates
+    def mock_search(track, limit=5):
+        if "Unmatched" in track.name:
+            return []
+        return orig_search(track, limit)
+    dest.search_candidates = mock_search
+
+    # Execute delta sync
+    plan = sync_svc.generate_sync_plan(mirror_id, destination=dest, source=updated_source)
+    report = sync_svc.execute_delta_sync(mirror_id, plan=plan, destination=dest, source=updated_source)
+
+    assert report.status == "PARTIAL_SUCCESS"
+    assert len(report.discrepancies) == 1
+    assert report.discrepancies[0].source_name == "Unmatched Song"
+    assert report.discrepancies[0].discrepancy_type == "UNMATCHED"
